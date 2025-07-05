@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU N-Body Particle Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #1a1a1a;
+            color: white;
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        
+        canvas {
+            border: 1px solid #333;
+            background: black;
+        }
+        
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        
+        .error {
+            color: #ff6b6b;
+            padding: 20px;
+            border: 1px solid #ff6b6b;
+            border-radius: 5px;
+            margin: 20px;
+            background: rgba(255, 107, 107, 0.1);
+        }
+    </style>
+</head>
+<body>
+    <h1>WebGPU N-Body Particle Simulation</h1>
+    <canvas id="canvas_container" width="800" height="600"></canvas>
+    <div class="controls">
+        <div>Particles: <span id="particle-count">2000</span></div>
+        <div>FPS: <span id="fps">--</span></div>
+    </div>
+
+    <script>
+        // Check WebGPU support immediately
+        async function checkWebGPUSupport() {
+            const status = document.createElement('div');
+            status.style.padding = '20px';
+            status.style.margin = '20px';
+            status.style.border = '1px solid #333';
+            status.style.borderRadius = '5px';
+            status.style.backgroundColor = '#2a2a2a';
+            
+            if (!navigator.gpu) {
+                status.innerHTML = `
+                    <h3 style="color: #ff6b6b;">WebGPU Not Supported</h3>
+                    <p>Your browser doesn't support WebGPU. Try:</p>
+                    <ul>
+                        <li>Chrome 113+ or Edge 113+ with hardware acceleration enabled</li>
+                        <li>Firefox Nightly with WebGPU enabled in about:config</li>
+                        <li>Make sure you're not in incognito/private mode</li>
+                    </ul>
+                `;
+                document.body.appendChild(status);
+                return false;
+            }
+
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) {
+                    status.innerHTML = `
+                        <h3 style="color: #ff6b6b;">No GPU Adapter Found</h3>
+                        <p>WebGPU is supported but no GPU adapter was found. Try enabling hardware acceleration in your browser settings.</p>
+                    `;
+                    document.body.appendChild(status);
+                    return false;
+                }
+
+                const device = await adapter.requestDevice();
+                status.innerHTML = `
+                    <h3 style="color: #4ecdc4;">WebGPU Ready!</h3>
+                    <p>Adapter: ${adapter.info?.description || 'Unknown'}</p>
+                    <p>Starting simulation...</p>
+                `;
+                document.body.appendChild(status);
+                
+                setTimeout(() => status.remove(), 3000);
+                return { adapter, device };
+            } catch (error) {
+                status.innerHTML = `
+                    <h3 style="color: #ff6b6b;">WebGPU Error</h3>
+                    <p>Error: ${error.message}</p>
+                `;
+                document.body.appendChild(status);
+                return false;
+            }
+        }
+
+        // Embedded shaders
+        const computeShader = `
+struct Body {
+    position: vec2<f32>,
+    velocity: vec2<f32>,
+    mass: f32,
+    padding: vec3<f32>,
+};
+
+@group(0) @binding(0) var<storage, read> bodiesIn: array<Body>;
+@group(0) @binding(1) var<storage, read_write> bodiesOut: array<Body>;
+
+const G: f32 = 0.05;
+const DT: f32 = 0.008;
+const EPSILON: f32 = 0.01;
+const DAMPING: f32 = 0.998;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let i = global_id.x;
+    if (i >= arrayLength(&bodiesIn)) {
+        return;
+    }
+
+    var body = bodiesIn[i];
+    var acc = vec2<f32>(0.0);
+
+    // Calculate gravitational forces from all other bodies
+    for (var j: u32 = 0; j < arrayLength(&bodiesIn); j++) {
+        if (i == j) { continue; }
+
+        let other = bodiesIn[j];
+        let dir = other.position - body.position;
+        let distSqr = max(dot(dir, dir), EPSILON);
+        
+        let force = G * other.mass / distSqr;
+        acc += normalize(dir) * force;
+    }
+
+    // Update velocity and position
+    body.velocity = (body.velocity + acc * DT) * DAMPING;
+    body.position += body.velocity * DT;
+    
+    // Boundary conditions - bounce off edges with energy loss
+    if (body.position.x > 0.95) {
+        body.position.x = 0.95;
+        body.velocity.x *= -0.7;
+    }
+    if (body.position.x < -0.95) {
+        body.position.x = -0.95;
+        body.velocity.x *= -0.7;
+    }
+    if (body.position.y > 0.95) {
+        body.position.y = 0.95;
+        body.velocity.y *= -0.7;
+    }
+    if (body.position.y < -0.95) {
+        body.position.y = -0.95;
+        body.velocity.y *= -0.7;
+    }
+
+    bodiesOut[i] = body;
+}`;
+
+        const renderShader = `
+struct VertexInput {
+    @location(0) position: vec2<f32>
+};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec3<f32>
+};
+
+@vertex
+fn vs_main(input: VertexInput, @builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+    var output: VertexOutput;
+    
+    // Create a small triangle for each particle
+    let particleIndex = vertexIndex / 3u;
+    let triangleVertex = vertexIndex % 3u;
+    
+    let center = input.position;
+    let size = 0.005; // Small triangle size
+    
+    var offset: vec2<f32>;
+    if (triangleVertex == 0u) {
+        offset = vec2<f32>(0.0, size);
+    } else if (triangleVertex == 1u) {
+        offset = vec2<f32>(-size * 0.866, -size * 0.5);
+    } else {
+        offset = vec2<f32>(size * 0.866, -size * 0.5);
+    }
+    
+    output.position = vec4<f32>(center + offset, 0.0, 1.0);
+    output.color = vec3<f32>(1.0, 0.8, 0.4);
+    
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 1.0);
+}`;
+
+        async function init() {
+            // Check WebGPU support first
+            const gpuSupport = await checkWebGPUSupport();
+            if (!gpuSupport) {
+                return;
+            }
+
+            const { adapter, device } = gpuSupport;
+            
+            const N = 20;
+            const BODY_SIZE = 32; // 8 floats * 4 bytes = 32 bytes
+            const BUFFER_SIZE = N * BODY_SIZE;
+
+            const canvas = document.getElementById("canvas_container");
+            const context = canvas.getContext("webgpu");
+
+            device.lost.then(() => {
+                throw new Error("WebGPU logical device was lost");
+            });
+
+            const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+            context.configure({
+                device,
+                format: canvasFormat,
+                alphaMode: "opaque"
+            });
+
+            const computeModule = device.createShaderModule({
+                code: computeShader
+            });
+
+            const renderModule = device.createShaderModule({
+                code: renderShader
+            });
+
+            const bindGroupLayout = device.createBindGroupLayout({
+                entries: [
+                    {
+                        binding: 0,
+                        visibility: GPUShaderStage.COMPUTE,
+                        buffer: { type: "read-only-storage" }
+                    },
+                    {
+                        binding: 1,
+                        visibility: GPUShaderStage.COMPUTE,
+                        buffer: { type: "storage" }
+                    }
+                ]
+            });
+
+            const layout = device.createPipelineLayout({
+                bindGroupLayouts: [bindGroupLayout]
+            });
+
+            const computePipeline = device.createComputePipeline({
+                layout: layout,
+                compute: {
+                    module: computeModule,
+                    entryPoint: "main"
+                }
+            });
+
+            const renderPipeline = device.createRenderPipeline({
+                layout: "auto",
+                vertex: {
+                    module: renderModule,
+                    entryPoint: "vs_main",
+                    buffers: [{
+                        arrayStride: 32,
+                        stepMode: "instance",
+                        attributes: [{
+                            shaderLocation: 0,
+                            offset: 0,
+                            format: "float32x2"
+                        }]
+                    }]
+                },
+                fragment: {
+                    module: renderModule,
+                    entryPoint: "fs_main",
+                    targets: [{ format: canvasFormat }]
+                },
+                primitive: {
+                    topology: "triangle-list"
+                }
+            });
+
+            // Create ping-pong buffers for proper double buffering
+            const buffer1 = device.createBuffer({
+                size: BUFFER_SIZE,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+            });
+
+            const buffer2 = device.createBuffer({
+                size: BUFFER_SIZE,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_SRC
+            });
+
+            // Initialize particle data with better distribution
+            const inputData = new Float32Array(N * 8);
+            for (let i = 0; i < N; i++) {
+                const offset = i * 8;
+                
+                // Create multiple clusters for more interesting dynamics
+                const clusterCount = 4;
+                const clusterIndex = Math.floor(Math.random() * clusterCount);
+                
+                let centerX, centerY;
+                switch(clusterIndex) {
+                    case 0: centerX = -0.3; centerY = -0.3; break;
+                    case 1: centerX = 0.3; centerY = -0.3; break;
+                    case 2: centerX = -0.3; centerY = 0.3; break;
+                    case 3: centerX = 0.3; centerY = 0.3; break;
+                }
+                
+                // Add some randomness around cluster center
+                const angle = Math.random() * Math.PI * 2;
+                const radius = Math.random() * 0.15;
+                
+                inputData[offset + 0] = centerX + Math.cos(angle) * radius; // X position
+                inputData[offset + 1] = centerY + Math.sin(angle) * radius; // Y position
+                inputData[offset + 2] = (Math.random() - 0.5) * 0.02; // X velocity
+                inputData[offset + 3] = (Math.random() - 0.5) * 0.02; // Y velocity
+                inputData[offset + 4] = Math.random() * 2.0 + 0.5; // Mass (0.5 to 2.5)
+                inputData[offset + 5] = 0; // Padding
+                inputData[offset + 6] = 0; // Padding
+                inputData[offset + 7] = 0; // Padding
+            }
+
+            device.queue.writeBuffer(buffer1, 0, inputData);
+
+            // Create bind groups for ping-pong rendering
+            const bindGroup1 = device.createBindGroup({
+                layout: bindGroupLayout,
+                entries: [
+                    { binding: 0, resource: { buffer: buffer1 } },
+                    { binding: 1, resource: { buffer: buffer2 } }
+                ]
+            });
+
+            const bindGroup2 = device.createBindGroup({
+                layout: bindGroupLayout,
+                entries: [
+                    { binding: 0, resource: { buffer: buffer2 } },
+                    { binding: 1, resource: { buffer: buffer1 } }
+                ]
+            });
+
+            let frame = 0;
+            let lastTime = performance.now();
+            let frameCount = 0;
+
+            // Add debugging buffer to check particle positions
+            const debugBuffer = device.createBuffer({
+                size: 64, // First 8 particles * 8 floats
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+            });
+
+            function renderLoop() {
+                const currentTime = performance.now();
+                frameCount++;
+
+                // Update FPS every second
+                if (currentTime - lastTime >= 1000) {
+                    document.getElementById('fps').textContent = Math.round(frameCount * 1000 / (currentTime - lastTime));
+                    frameCount = 0;
+                    lastTime = currentTime;
+                }
+
+                const commandEncoder = device.createCommandEncoder();
+
+                // Ping-pong between buffers
+                const isEvenFrame = frame % 2 === 0;
+                const currentBindGroup = isEvenFrame ? bindGroup1 : bindGroup2;
+                const currentRenderBuffer = isEvenFrame ? buffer2 : buffer1;
+
+                // Compute pass
+                const computePass = commandEncoder.beginComputePass();
+                computePass.setPipeline(computePipeline);
+                computePass.setBindGroup(0, currentBindGroup);
+                computePass.dispatchWorkgroups(Math.ceil(N / 64));
+                computePass.end();
+
+                // Render pass
+                const textureView = context.getCurrentTexture().createView();
+                const renderPass = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: textureView,
+                        loadOp: "clear",
+                        clearValue: { r: 0.05, g: 0.05, b: 0.1, a: 1 },
+                        storeOp: "store"
+                    }]
+                });
+
+                renderPass.setPipeline(renderPipeline);
+                renderPass.setVertexBuffer(0, currentRenderBuffer);
+                renderPass.draw(3, N, 0, 0); // 3 vertices per triangle, N instances
+                renderPass.end();
+
+                // Debug: copy first few particles to check positions every 60 frames
+                if (frame % 60 === 0) {
+                    commandEncoder.copyBufferToBuffer(currentRenderBuffer, 0, debugBuffer, 0, 64);
+                }
+
+                device.queue.submit([commandEncoder.finish()]);
+
+                // Debug output every 60 frames
+                if (frame % 60 === 0) {
+                    debugBuffer.mapAsync(GPUMapMode.READ).then(() => {
+                        const data = new Float32Array(debugBuffer.getMappedRange());
+                        console.log('First particle:', {
+                            x: data[0], y: data[1], 
+                            vx: data[2], vy: data[3], 
+                            mass: data[4]
+                        });
+                        debugBuffer.unmap();
+                    });
+                }
+
+                frame++;
+                requestAnimationFrame(renderLoop);
+            }
+
+            renderLoop();
+        }
+
+        // Initialize the simulation
+        init().catch(error => {
+            console.error("Failed to initialize WebGPU simulation:", error);
+            document.body.innerHTML = `<div class="error">
+                <h2>WebGPU Error</h2>
+                <p>${error.message}</p>
+                <p>Make sure you're using a browser that supports WebGPU (Chrome 113+, Edge 113+, etc.) and have hardware acceleration enabled.</p>
+            </div>`;
+        });
+    </script>
+</body>
+</html>
